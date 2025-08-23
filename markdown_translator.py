@@ -61,7 +61,6 @@ class MarkdownTranslator:
         # Model selection via env vars (allow overriding defaults)
         self.openai_model = os.getenv("OPENAI_MODEL", "gpt-5")
         self.anthropic_model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
-        self.mistral_model = os.getenv("MISTRAL_MODEL", "mistral-medium-2508")
         # Shared decoding settings
         try:
             self.temperature = float(os.getenv("TEMPERATURE", "0.2"))
@@ -102,8 +101,8 @@ class MarkdownTranslator:
     def compute_cost(self, provider: str, tokens: int) -> float:
         """Compute cost in USD for given provider and token count.
 
-        Reads per-1k-token rates from environment:
-          OPENAI_COST_PER_1K, ANTHROPIC_COST_PER_1K, MISTRAL_COST_PER_1K
+                Reads per-1k-token rates from environment:
+                    OPENAI_COST_PER_1K, ANTHROPIC_COST_PER_1K
         Defaults to 0.0 if not set.
         """
         def _get_rate(env_name: str) -> float:
@@ -116,8 +115,6 @@ class MarkdownTranslator:
             rate = _get_rate("OPENAI_COST_PER_1K")
         elif provider == "anthropic":
             rate = _get_rate("ANTHROPIC_COST_PER_1K")
-        elif provider == "mistral":
-            rate = _get_rate("MISTRAL_COST_PER_1K")
         else:
             rate = 0.0
 
@@ -180,7 +177,6 @@ class MarkdownTranslator:
         providers = {
             "openai": self._translate_chunk_openai,
             "anthropic": self._translate_chunk_anthropic,
-            "mistral": self._translate_chunk_mistral,
         }
         translate_fn = providers.get(provider)
         if translate_fn is None:
@@ -339,74 +335,7 @@ class MarkdownTranslator:
         except Exception:
             return str(response), self._estimate_tokens(content)
 
-    def _translate_chunk_mistral(self, content: str, chunk_type: str) -> Tuple[str, int]:
-        """Translate using a Mistral-compatible HTTP API.
-
-        This uses environment variables:
-        - MISTRAL_API_KEY: API key for Mistral
-        - MISTRAL_MODEL: model id (e.g., 'mistral-large')
-        The function uses urllib to avoid adding an extra dependency.
-        """
-        prompt = self._build_translation_prompt(content, chunk_type)
-
-        api_key = os.getenv("MISTRAL_API_KEY")
-        model = self.mistral_model
-        if not api_key:
-            # Make this explicit and return a clear signal to the caller so the
-            # comparison runner can continue and report that Mistral was skipped.
-            raise RuntimeError("MISTRAL_API_KEY environment variable is not set; skipping Mistral provider")
-
-        # Minimal HTTP call using stdlib
-        import json
-        from urllib.request import Request, urlopen
-
-        # Combine the shared system prompt and the user prompt into the input so
-        # the Mistral HTTP endpoint receives the same intent and instructions.
-        combined_input = f"{self.system_prompt}\n\n{prompt}"
-
-        body = json.dumps({
-            "model": model,
-            "input": combined_input,
-            "temperature": self.temperature,
-            # 'max_new_tokens' is a common name for some Mistral-like APIs; include a conservative cap
-            "max_new_tokens": 2000,
-        }).encode("utf-8")
-
-        req = Request(
-            url=f"https://api.mistral.ai/v1/models/{model}/completions",
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            },
-            method="POST",
-        )
-
-        try:
-            with urlopen(req, timeout=30) as resp:
-                resp_data = json.load(resp)
-        except Exception as exc:
-            raise RuntimeError(f"Mistral request failed: {exc}")
-
-        # Attempt to extract text from common response shapes
-        # For example: {"choices": [{"text": "..."}]}
-        try:
-            choices = resp_data.get("choices") or []
-            if choices:
-                text = choices[0].get("text", "")
-                # if API provides token info
-                usage = resp_data.get("usage")
-                tok_count = None
-                if isinstance(usage, dict):
-                    tok_count = usage.get("total_tokens")
-                if tok_count:
-                    return text, int(tok_count)
-                return text, self._estimate_tokens(content)
-        except Exception:
-            pass
-
-        return str(resp_data), self._estimate_tokens(content)
-
+    # Support removed
     # -- High-level workflow ------------------------------------------------
     def translate_full_markdown(self, markdown_text: str, provider: str = "openai") -> Tuple[str, int]:
         """Translate an entire markdown document while preserving structure.

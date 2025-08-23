@@ -1,5 +1,4 @@
 from pathlib import Path
-import os
 import pymupdf4llm
 import argparse
 import time
@@ -39,11 +38,7 @@ def main(pdf_path: str = "pdfs/perks.pdf", compare: bool = False):
     translator = MarkdownTranslator()
 
     if compare:
-        providers = ["openai", "anthropic", "mistral"]
-        # Require Mistral key if Mistral is included in compare to avoid silent skips
-        if "mistral" in providers and not os.getenv("MISTRAL_API_KEY"):
-            print("MISTRAL_API_KEY is not set. Set it to include Mistral in --compare or run with --providers to exclude it.")
-            return
+        providers = ["openai", "anthropic"]
         stats = []
         for p in providers:
             print(f"\n=== {p.upper()} Translation ===")
@@ -96,6 +91,6 @@ def main(pdf_path: str = "pdfs/perks.pdf", compare: bool = False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("pdf", nargs="?", default="pdfs/perks.pdf", help="PDF path to translate")
-    parser.add_argument("--compare", action="store_true", help="Run translations across openai, anthropic and mistral and save outputs")
+    parser.add_argument("--compare", action="store_true", help="Run translations across openai and anthropic and save outputs")
     args = parser.parse_args()
     main(args.pdf, compare=args.compare)
