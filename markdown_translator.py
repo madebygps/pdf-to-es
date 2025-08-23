@@ -1,242 +1,474 @@
+"""markdown_translator
+Clean, modular translator for markdown-based PDF translation.
+
+This module provides a single `MarkdownTranslator` class and small helpers
+to keep prompt loading, chunking, translation and PDF-generation responsibilities
+separated and easy to test.
 """
-Markdown-based PDF translation system.
-Translate markdown first, then generate PDF from Spanish markdown.
-"""
+
+from __future__ import annotations
 
 import os
 import re
-from typing import List, Tuple
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import List, Optional, Tuple, Any
+
 import openai
 import anthropic
 from dotenv import load_dotenv
 
 load_dotenv()
 
+TYPE_GUIDANCE = {
+    "title": "This is a main title - keep it concise and impactful in Spanish",
+    "heading": "This is a section heading - maintain clarity and professional tone",
+    "subheading": "This is a subsection heading - keep it descriptive but brief",
+    "list_item": "These are list items - maintain parallel structure and conciseness",
+    "bold": "This is emphasized text - preserve the emphasis and meaning",
+    "body": "This is body text - use natural, professional Spanish",
+}
+
+
+def load_prompt_template(path: Optional[Path]) -> Optional[str]:
+    """Load an external prompt template from disk, if available.
+
+    Returns the template string or None if it cannot be read.
+    """
+    if not path:
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            return fh.read()
+    except Exception:
+        return None
+
+
 class MarkdownTranslator:
-    def __init__(self):
-        self.openai_client = openai.OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-        self.anthropic_client = anthropic.Anthropic(api_key=os.getenv('ANTHROPIC_API_KEY'))
-    
+    """High-level translator that keeps prompt-loading, chunking and provider
+    integration well separated for easier testing and extension.
+    """
+
+    def __init__(self, *, prompt_path: Optional[Path] = None):
+        self.openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        self.anthropic_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+        # Determine external prompt template path and cache contents
+        default_prompt_path = Path(__file__).parent / "prompts" / "translation_prompt.txt"
+        self._prompt_path = Path(prompt_path) if prompt_path is not None else default_prompt_path
+        self._template = load_prompt_template(self._prompt_path)
+        # Model selection via env vars (allow overriding defaults)
+        self.openai_model = os.getenv("OPENAI_MODEL", "gpt-5")
+        self.anthropic_model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+        self.mistral_model = os.getenv("MISTRAL_MODEL", "mistral-medium-2508")
+        # Shared decoding settings
+        try:
+            self.temperature = float(os.getenv("TEMPERATURE", "0.2"))
+        except Exception:
+            self.temperature = 0.2
+        # Shared system prompt used across providers for parity
+        self.system_prompt = (
+            "You are a professional translator specializing in corporate documents.\n"
+            "Translate English markdown to Spanish while preserving formatting and style."
+        )
+
+    def _build_translation_prompt(self, content: str, chunk_type: str) -> str:
+        """Construct the prompt to send to the provider. Uses an external template
+        when available, and falls back to a concise inline prompt otherwise.
+        """
+        guidance = TYPE_GUIDANCE.get(chunk_type, "Translate this text naturally to Spanish")
+
+        if self._template:
+            try:
+                return self._template.format(guidance=guidance, content=content)
+            except Exception:
+                # If the external template is malformed, fall back to inline.
+                pass
+
+        # Minimal inline fallback to keep functionality if template is missing
+        return f"{guidance}\n\nEnglish markdown:\n{content}\n\nSpanish translation:"
+
+    # -- Token estimation & cost helpers ---------------------------------
+    def _estimate_tokens(self, *texts: str) -> int:
+        """Rudimentary token estimator used when provider doesn't return usage.
+
+        Uses a simple chars->tokens heuristic (~4 chars/token). This is
+        intentionally conservative for quick cost estimates.
+        """
+        total_chars = sum(len(t or "") for t in texts)
+        return max(1, int(total_chars / 4))
+
+    def compute_cost(self, provider: str, tokens: int) -> float:
+        """Compute cost in USD for given provider and token count.
+
+        Reads per-1k-token rates from environment:
+          OPENAI_COST_PER_1K, ANTHROPIC_COST_PER_1K, MISTRAL_COST_PER_1K
+        Defaults to 0.0 if not set.
+        """
+        def _get_rate(env_name: str) -> float:
+            try:
+                return float(os.getenv(env_name, "0.0"))
+            except Exception:
+                return 0.0
+
+        if provider == "openai":
+            rate = _get_rate("OPENAI_COST_PER_1K")
+        elif provider == "anthropic":
+            rate = _get_rate("ANTHROPIC_COST_PER_1K")
+        elif provider == "mistral":
+            rate = _get_rate("MISTRAL_COST_PER_1K")
+        else:
+            rate = 0.0
+
+        return (tokens / 1000.0) * rate
+
+    # -- Chunking ---------------------------------------------------------
     def split_markdown_for_translation(self, markdown_text: str, max_chunk_chars: int = 2000) -> List[Tuple[str, str]]:
+        """Split markdown into logical chunks while preserving structure.
+
+        Returns a list of (chunk_type, content) tuples.
         """
-        Split markdown into logical chunks for translation while preserving structure.
-        Returns list of (chunk_type, content) tuples.
-        """
-        chunks = []
-        current_chunk = ""
+        chunks: List[Tuple[str, str]] = []
+        current_chunk = []  # list[str] for efficient concat
         current_type = "body"
-        
-        lines = markdown_text.split('\n')
-        
-        for line in lines:
-            line_with_newline = line + '\n'
-            
-            # Detect different markdown elements
-            if line.startswith('# '):
+
+        def flush_current():
+            nonlocal current_chunk, current_type
+            if current_chunk:
+                chunks.append((current_type, "".join(current_chunk).strip()))
+                current_chunk = []
+
+        for line in markdown_text.splitlines():
+            line_with_newline = line + "\n"
+
+            if line.startswith("# "):
                 chunk_type = "title"
-            elif line.startswith('## '):
+            elif line.startswith("## "):
                 chunk_type = "heading"
-            elif line.startswith('### '):
+            elif line.startswith("### "):
                 chunk_type = "subheading"
-            elif line.startswith('- ') or line.startswith('* ') or re.match(r'^\d+\. ', line):
+            elif line.startswith("- ") or line.startswith("* ") or re.match(r"^\d+\. ", line):
                 chunk_type = "list_item"
-            elif line.startswith('**') and line.endswith('**'):
+            elif line.startswith("**") and line.endswith("**"):
                 chunk_type = "bold"
             elif line.strip() == "":
                 chunk_type = "whitespace"
             else:
                 chunk_type = "body"
-            
-            # If we're starting a new section or chunk is getting too large
-            if (chunk_type in ["title", "heading", "subheading"] and current_chunk.strip()) or \
-               (len(current_chunk) + len(line_with_newline) > max_chunk_chars and current_chunk.strip()):
-                
-                if current_chunk.strip():
-                    chunks.append((current_type, current_chunk.strip()))
-                current_chunk = line_with_newline
+
+            # if new structural element and current has content -> flush
+            if (chunk_type in {"title", "heading", "subheading"} and current_chunk) or \
+               (sum(len(s) for s in current_chunk) + len(line_with_newline) > max_chunk_chars and current_chunk):
+                flush_current()
+                current_chunk = [line_with_newline]
                 current_type = chunk_type
             else:
-                current_chunk += line_with_newline
-                # Update type for the chunk (prefer more specific types)
-                if chunk_type in ["title", "heading", "subheading"] and current_type == "body":
+                current_chunk.append(line_with_newline)
+                if chunk_type in {"title", "heading", "subheading"} and current_type == "body":
                     current_type = chunk_type
-        
-        # Add the last chunk
-        if current_chunk.strip():
-            chunks.append((current_type, current_chunk.strip()))
-        
+
+        flush_current()
         return chunks
-    
-    def translate_markdown_chunk(self, chunk_content: str, chunk_type: str, provider: str = "openai") -> str:
-        """Translate a single markdown chunk with type-aware prompts"""
-        
-        if provider == "openai":
-            return self._translate_chunk_openai(chunk_content, chunk_type)
-        else:
-            return self._translate_chunk_anthropic(chunk_content, chunk_type)
-    
-    def _translate_chunk_openai(self, content: str, chunk_type: str) -> str:
-        """Translate using OpenAI with markdown awareness"""
-        
-        type_guidance = {
-            "title": "This is a main title - keep it concise and impactful in Spanish",
-            "heading": "This is a section heading - maintain clarity and professional tone",
-            "subheading": "This is a subsection heading - keep it descriptive but brief",
-            "list_item": "These are list items - maintain parallel structure and conciseness",
-            "bold": "This is emphasized text - preserve the emphasis and meaning",
-            "body": "This is body text - use natural, professional Spanish"
+
+    # -- Provider dispatch ------------------------------------------------
+    def translate_markdown_chunk(self, chunk_content: str, chunk_type: str, provider: str = "openai") -> Tuple[str, int]:
+        """Translate a single chunk using the selected provider.
+
+        Returns a tuple of (translated_text, tokens_used).
+        """
+        providers = {
+            "openai": self._translate_chunk_openai,
+            "anthropic": self._translate_chunk_anthropic,
+            "mistral": self._translate_chunk_mistral,
         }
-        
-        guidance = type_guidance.get(chunk_type, "Translate this text naturally to Spanish")
-        
-        system_prompt = """You are a professional translator specializing in corporate documents. 
-        Translate English markdown to Spanish while:
-        1. PRESERVING ALL markdown formatting (# ## ### - * ** etc.)
-        2. Keeping translations concise and professional
-        3. Using natural Spanish business terminology
-        4. Maintaining document structure exactly"""
-        
-        user_prompt = f"""{guidance}
+        translate_fn = providers.get(provider)
+        if translate_fn is None:
+            raise ValueError(f"Unsupported provider: {provider}")
+        return translate_fn(chunk_content, chunk_type)
 
-CRITICAL: Preserve ALL markdown formatting exactly. Return ONLY the Spanish translation.
-
-English markdown:
-{content}
-
-Spanish translation:"""
-        
+    def _translate_chunk_openai(self, content: str, chunk_type: str) -> Tuple[str, int]:
+        """Translate a chunk using OpenAI."""
+        user_prompt = self._build_translation_prompt(content, chunk_type)
+        # Pass temperature to make decoding settings consistent across providers
         response = self.openai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0.3
+            model=self.openai_model,
+            messages=[{"role": "system", "content": self.system_prompt}, {"role": "user", "content": user_prompt}],
+            
         )
-        
-        return response.choices[0].message.content or ""
-    
-    def _translate_chunk_anthropic(self, content: str, chunk_type: str) -> str:
-        """Translate using Anthropic with markdown awareness"""
-        
-        type_guidance = {
-            "title": "This is a main title - keep it concise and impactful",
-            "heading": "This is a section heading - maintain clarity and professional tone", 
-            "subheading": "This is a subsection heading - keep it descriptive but brief",
-            "list_item": "These are list items - maintain parallel structure and conciseness",
-            "bold": "This is emphasized text - preserve the emphasis and meaning",
-            "body": "This is body text - use natural, professional Spanish"
-        }
-        
-        guidance = type_guidance.get(chunk_type, "Translate this text naturally to Spanish")
-        
-        prompt = f"""Translate this English markdown to Spanish. {guidance}
 
-CRITICAL REQUIREMENTS:
-1. Preserve ALL markdown formatting exactly (# ## ### - * ** etc.)
-2. Return ONLY the Spanish translation - no analysis or explanations
-3. Keep translations concise and professional
-4. Use natural Spanish business terminology
+        # Try common response shapes safely
+        # Try to return text and usage if available
+        try:
+            text = response.choices[0].message.content or ""
+            usage = getattr(response, "usage", None)
+            tok_count = None
+            if usage is not None:
+                if isinstance(usage, dict):
+                    tok_count = usage.get("total_tokens")
+                else:
+                    tok_count = getattr(usage, "total_tokens", None)
+            if tok_count:
+                return text, int(tok_count)
+        except Exception:
+            pass
 
-English markdown:
-{content}
+        # Fallback to estimate tokens
+        return (getattr(getattr(response.choices[0], "message", ""), "content", str(response)), self._estimate_tokens(content))
 
-Spanish translation:"""
-        
-        response = self.anthropic_client.messages.create(
-            model="claude-3-5-sonnet-20241022",
-            max_tokens=2000,
-            messages=[{"role": "user", "content": prompt}]
+    def _translate_chunk_anthropic(self, content: str, chunk_type: str) -> Tuple[str, int]:
+        """Translate a chunk using Anthropic."""
+        prompt = self._build_translation_prompt(content, chunk_type)
+        # Use the same system+user prompt pattern as OpenAI for parity
+        # Many Anthropics SDKs expect a single prompt string instead of a system/user
+        # role separation. Combine system and user prompts to ensure parity with
+        # other providers while remaining compatible with different SDK versions.
+        combined = f"{self.system_prompt}\n\n{prompt}"
+        # Try the completions API shape first (common in newer SDKs), then
+        # fall back to the messages API shape for older SDKs.
+        response = None
+        try:
+            response = self.anthropic_client.completions.create(
+                model=self.anthropic_model,
+                prompt=combined,
+                max_tokens_to_sample=2000,
+                temperature=self.temperature,
+            )
+        except Exception:
+            try:
+                response = self.anthropic_client.messages.create(
+                    model=self.anthropic_model,
+                    messages=[{"role": "user", "content": combined}],
+                    max_tokens=2000,
+                    temperature=self.temperature,
+                )
+            except Exception:
+                # If both attempts fail, raise so caller can handle (and skip provider)
+                raise
+
+        # Robustly extract text from a variety of response shapes. The Anthropic
+        # SDK may return objects with different attributes depending on which
+        # resource was used (completions vs messages), so attempt multiple
+        # common accesses.
+        try:
+            # If response is a mapping-like object
+            resp_dict: dict[str, Any] = {}
+            if hasattr(response, "to_dict"):
+                try:
+                    resp_dict = response.to_dict()
+                except Exception:
+                    resp_dict = {}
+            elif isinstance(response, dict):
+                resp_dict = response
+            else:
+                # Try to coerce to dict via vars()
+                try:
+                    candidate = vars(response)
+                    if isinstance(candidate, dict):
+                        resp_dict = candidate
+                except Exception:
+                    resp_dict = {}
+
+            # Check a few possible keys and common SDK shapes
+            text: Any = None
+
+            # 1) If the SDK returned a 'content' field (Messages API), it's usually
+            #    a list of TextBlock-like objects. Extract .text from each block.
+            if hasattr(response, "content"):
+                try:
+                    content_blocks = getattr(response, "content")
+                    if isinstance(content_blocks, list) and content_blocks:
+                        pieces: list[str] = []
+                        for blk in content_blocks:
+                            if isinstance(blk, dict):
+                                btext = blk.get("text") or blk.get("content")
+                                if btext:
+                                    pieces.append(str(btext))
+                            else:
+                                # object from SDK; try attribute access
+                                btext = getattr(blk, "text", None)
+                                if btext:
+                                    pieces.append(str(btext))
+                                else:
+                                    pieces.append(str(blk))
+                        text = "\n\n".join(pieces)
+                except Exception:
+                    text = None
+
+            # 2) If not messages-style, inspect resp_dict for completions/messages shapes
+            if not text and isinstance(resp_dict, dict):
+                if "completion" in resp_dict and isinstance(resp_dict["completion"], str):
+                    text = resp_dict["completion"]
+                elif "text" in resp_dict and isinstance(resp_dict["text"], str):
+                    text = resp_dict["text"]
+                elif "choices" in resp_dict and isinstance(resp_dict["choices"], list) and len(resp_dict["choices"]) > 0:
+                    first = resp_dict["choices"][0]
+                    if isinstance(first, dict):
+                        text = first.get("text") or first.get("completion") or first.get("content")
+
+            # 3) Fallback to attribute access
+            if not text:
+                if hasattr(response, "completion"):
+                    text = getattr(response, "completion")
+                elif hasattr(response, "text"):
+                    text = getattr(response, "text")
+
+            # Final fallback
+            if text is None:
+                text = str(response)
+
+            # Try token usage extraction
+            usage = None
+            if isinstance(resp_dict, dict):
+                usage = resp_dict.get("usage")
+            if usage is None and hasattr(response, "usage"):
+                usage = getattr(response, "usage")
+
+            tok_count = None
+            if usage is not None:
+                if isinstance(usage, dict):
+                    tok_count = usage.get("total_tokens") or usage.get("total-token")
+                else:
+                    tok_count = getattr(usage, "total_tokens", None)
+
+            # Ensure we return a str for text
+            text_str = str(text)
+            if tok_count:
+                return text_str, int(tok_count)
+            return text_str, self._estimate_tokens(content)
+        except Exception:
+            return str(response), self._estimate_tokens(content)
+
+    def _translate_chunk_mistral(self, content: str, chunk_type: str) -> Tuple[str, int]:
+        """Translate using a Mistral-compatible HTTP API.
+
+        This uses environment variables:
+        - MISTRAL_API_KEY: API key for Mistral
+        - MISTRAL_MODEL: model id (e.g., 'mistral-large')
+        The function uses urllib to avoid adding an extra dependency.
+        """
+        prompt = self._build_translation_prompt(content, chunk_type)
+
+        api_key = os.getenv("MISTRAL_API_KEY")
+        model = self.mistral_model
+        if not api_key:
+            # Make this explicit and return a clear signal to the caller so the
+            # comparison runner can continue and report that Mistral was skipped.
+            raise RuntimeError("MISTRAL_API_KEY environment variable is not set; skipping Mistral provider")
+
+        # Minimal HTTP call using stdlib
+        import json
+        from urllib.request import Request, urlopen
+
+        # Combine the shared system prompt and the user prompt into the input so
+        # the Mistral HTTP endpoint receives the same intent and instructions.
+        combined_input = f"{self.system_prompt}\n\n{prompt}"
+
+        body = json.dumps({
+            "model": model,
+            "input": combined_input,
+            "temperature": self.temperature,
+            # 'max_new_tokens' is a common name for some Mistral-like APIs; include a conservative cap
+            "max_new_tokens": 2000,
+        }).encode("utf-8")
+
+        req = Request(
+            url=f"https://api.mistral.ai/v1/models/{model}/completions",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            method="POST",
         )
-        
-        # Type checking workaround - access text dynamically
-        first_content = response.content[0]
-        return getattr(first_content, 'text', str(first_content))
-    
-    def translate_full_markdown(self, markdown_text: str, provider: str = "openai") -> str:
-        """Translate entire markdown document maintaining structure"""
-        
+
+        try:
+            with urlopen(req, timeout=30) as resp:
+                resp_data = json.load(resp)
+        except Exception as exc:
+            raise RuntimeError(f"Mistral request failed: {exc}")
+
+        # Attempt to extract text from common response shapes
+        # For example: {"choices": [{"text": "..."}]}
+        try:
+            choices = resp_data.get("choices") or []
+            if choices:
+                text = choices[0].get("text", "")
+                # if API provides token info
+                usage = resp_data.get("usage")
+                tok_count = None
+                if isinstance(usage, dict):
+                    tok_count = usage.get("total_tokens")
+                if tok_count:
+                    return text, int(tok_count)
+                return text, self._estimate_tokens(content)
+        except Exception:
+            pass
+
+        return str(resp_data), self._estimate_tokens(content)
+
+    # -- High-level workflow ------------------------------------------------
+    def translate_full_markdown(self, markdown_text: str, provider: str = "openai") -> Tuple[str, int]:
+        """Translate an entire markdown document while preserving structure.
+
+        Returns a tuple (translated_text, total_tokens) for the whole document.
+        """
         print(f"Splitting markdown into chunks for {provider} translation...")
         chunks = self.split_markdown_for_translation(markdown_text)
         print(f"Created {len(chunks)} chunks")
-        
-        translated_chunks = []
-        
+
+        translated_chunks: List[str] = []
+        total_tokens = 0
         for i, (chunk_type, content) in enumerate(chunks):
             print(f"Translating chunk {i+1}/{len(chunks)} (type: {chunk_type})")
-            
-            translated = self.translate_markdown_chunk(content, chunk_type, provider)
-            translated_chunks.append(translated)
-        
-        # Join with double newlines to maintain document structure
-        return '\n\n'.join(translated_chunks)
-    
+            text, tokens = self.translate_markdown_chunk(content, chunk_type, provider)
+            translated_chunks.append(text)
+            total_tokens += tokens
+
+        return "\n\n".join(translated_chunks), total_tokens
+
+    # -- PDF generation -----------------------------------------------------
     def markdown_to_pdf(self, markdown_text: str, output_path: str):
-        """Convert markdown to PDF using a markdown-to-PDF library"""
+        """Convert markdown to PDF using available system tooling or Python fallbacks."""
         try:
-            # Try using markdown-pdf (requires npm install -g markdown-pdf)
-            import subprocess
-            import tempfile
-            import os
-            
-            # Create temporary markdown file
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False) as temp_md:
+            # Try markdown-pdf (npm) then pandoc, then Python library fallback
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as temp_md:
                 temp_md.write(markdown_text)
                 temp_md_path = temp_md.name
-            
+
             try:
-                # Try markdown-pdf first
-                result = subprocess.run([
-                    'markdown-pdf', 
-                    temp_md_path, 
-                    '-o', output_path
-                ], capture_output=True, text=True, check=True)
+                subprocess.run(["markdown-pdf", temp_md_path, "-o", output_path], capture_output=True, text=True, check=True)
                 print(f"PDF generated successfully: {output_path}")
-                
+                return
             except (subprocess.CalledProcessError, FileNotFoundError):
-                # Fallback: Try pandoc
-                try:
-                    result = subprocess.run([
-                        'pandoc', 
-                        temp_md_path, 
-                        '-o', output_path,
-                        '--pdf-engine=xelatex'
-                    ], capture_output=True, text=True, check=True)
-                    print(f"PDF generated successfully with pandoc: {output_path}")
-                    
-                except (subprocess.CalledProcessError, FileNotFoundError):
-                    # Final fallback: Use Python libraries
-                    self._markdown_to_pdf_python(markdown_text, output_path)
-                    
-            finally:
-                # Clean up temp file
-                os.unlink(temp_md_path)
-                
-        except Exception as e:
-            print(f"Error generating PDF: {e}")
-            print("Falling back to Python-based PDF generation...")
+                pass
+
+            try:
+                subprocess.run(["pandoc", temp_md_path, "-o", output_path, "--pdf-engine=xelatex"], capture_output=True, text=True, check=True)
+                print(f"PDF generated successfully with pandoc: {output_path}")
+                return
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                pass
+
+            # final fallback
             self._markdown_to_pdf_python(markdown_text, output_path)
-    
+
+        finally:
+            try:
+                os.unlink(temp_md_path)
+            except Exception:
+                pass
+
     def _markdown_to_pdf_python(self, markdown_text: str, output_path: str):
-        """Fallback PDF generation using Python libraries"""
+        """Generate a PDF using markdown -> HTML -> PDF via weasyprint or save HTML as final fallback."""
         try:
-            # Try using markdown + weasyprint
             import markdown
             from weasyprint import HTML, CSS
-            
-            # Convert markdown to HTML
-            html_content = markdown.markdown(markdown_text, extensions=['tables', 'fenced_code'])
-            
-            # Basic CSS for professional appearance
+
+            html_content = markdown.markdown(markdown_text, extensions=["tables", "fenced_code"])
+
             css_style = """
-            body { 
-                font-family: Arial, sans-serif; 
-                line-height: 1.6; 
-                max-width: 800px; 
-                margin: 40px auto; 
-                padding: 20px;
-                color: #333;
-            }
+            body { font-family: Arial, sans-serif; line-height: 1.6; max-width: 800px; margin: 40px auto; padding: 20px; color: #333; }
             h1 { color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 10px; }
             h2 { color: #34495e; border-bottom: 1px solid #bdc3c7; padding-bottom: 5px; }
             h3 { color: #7f8c8d; }
@@ -244,25 +476,22 @@ Spanish translation:"""
             li { margin-bottom: 5px; }
             p { margin-bottom: 15px; }
             """
-            
-            # Generate PDF
+
             html_doc = f"<html><head><meta charset='utf-8'></head><body>{html_content}</body></html>"
             HTML(string=html_doc).write_pdf(output_path, stylesheets=[CSS(string=css_style)])
             print(f"PDF generated with weasyprint: {output_path}")
-            
+
         except ImportError:
             print("Required packages not available. Installing...")
-            import subprocess
-            subprocess.run(['uv', 'add', 'weasyprint', 'markdown'], check=True)
-            # Retry
+            subprocess.run(["uv", "add", "weasyprint", "markdown"], check=True)
+            # Retry once
             self._markdown_to_pdf_python(markdown_text, output_path)
-            
-        except Exception as e:
-            print(f"Error in Python PDF generation: {e}")
-            # Save as HTML as final fallback
-            html_path = output_path.replace('.pdf', '.html')
-            with open(html_path, 'w', encoding='utf-8') as f:
-                import markdown
-                html_content = markdown.markdown(markdown_text, extensions=['tables', 'fenced_code'])
-                f.write(f"<html><head><meta charset='utf-8'></head><body>{html_content}</body></html>")
+
+        except Exception as exc:
+            print(f"Error in Python PDF generation: {exc}")
+            html_path = output_path.replace(".pdf", ".html")
+            with open(html_path, "w", encoding="utf-8") as f:
+                import markdown as _md
+
+                f.write(f"<html><head><meta charset='utf-8'></head><body>{_md.markdown(markdown_text, extensions=['tables','fenced_code'])}</body></html>")
             print(f"Saved as HTML instead: {html_path}")

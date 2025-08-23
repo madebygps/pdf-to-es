@@ -2,3 +2,5 @@
 .DS_Store
 /pdfs
 /translated
+__pycache__
+output.md
