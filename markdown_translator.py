@@ -31,20 +31,6 @@ TYPE_GUIDANCE = {
 }
 
 
-def load_prompt_template(path: Optional[Path]) -> Optional[str]:
-    """Load an external prompt template from disk, if available.
-
-    Returns the template string or None if it cannot be read.
-    """
-    if not path:
-        return None
-    try:
-        with path.open("r", encoding="utf-8") as fh:
-            return fh.read()
-    except Exception:
-        return None
-
-
 class MarkdownTranslator:
     """High-level translator that keeps prompt-loading, chunking and provider
     integration well separated for easier testing and extension.
@@ -54,10 +40,6 @@ class MarkdownTranslator:
         self.openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         self.anthropic_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
-        # Determine external prompt template path and cache contents
-        default_prompt_path = Path(__file__).parent / "prompts" / "translation_prompt.txt"
-        self._prompt_path = Path(prompt_path) if prompt_path is not None else default_prompt_path
-        self._template = load_prompt_template(self._prompt_path)
         # Model selection via env vars (allow overriding defaults)
         self.openai_model = os.getenv("OPENAI_MODEL", "gpt-5")
         self.anthropic_model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
@@ -66,26 +48,73 @@ class MarkdownTranslator:
             self.temperature = float(os.getenv("TEMPERATURE", "0.2"))
         except Exception:
             self.temperature = 0.2
+        
+        # Speed optimization settings (configurable via environment)
+        reasoning_effort_str = os.getenv("REASONING_EFFORT", "minimal")
+        verbosity_str = os.getenv("VERBOSITY", "low")
+        
+        # Validate and set reasoning effort
+        if reasoning_effort_str in ["minimal", "low", "medium", "high"]:
+            self.reasoning_effort = reasoning_effort_str
+        else:
+            self.reasoning_effort = "minimal"
+        
+        # Validate and set verbosity  
+        if verbosity_str in ["low", "medium", "high"]:
+            self.verbosity = verbosity_str
+        else:
+            self.verbosity = "low"
         # Shared system prompt used across providers for parity
         self.system_prompt = (
-            "You are a professional translator specializing in corporate documents.\n"
-            "Translate English markdown to Spanish while preserving formatting and style."
+            "You are a professional Spanish translator specializing in HR, benefits, and corporate policy documents. "
+            "Your task is to translate English documents into formal, idiomatic Spanish while preserving accuracy, tone, and formatting.\n\n"
+            "### Translation Rules:\n"
+            "1. **Formality & Tone**\n"
+            "   - Always use formal register (**usted**).\n"
+            "   - Maintain a professional, neutral, and clear tone.\n\n"
+            "2. **Glossary Enforcement**\n"
+            "   - Apply the following translations consistently:\n"
+            "     - Performance Review → Evaluación de desempeño\n"
+            "     - Employee Handbook → Manual del empleado\n"
+            "     - Workplace Safety Program → Programa de seguridad en el lugar de trabajo\n"
+            "     - Coverage → Cobertura\n"
+            "     - Deductible → Deducible\n"
+            "     - Claim (insurance/benefits) → Reclamación\n"
+            "     - Vision and dental services → Servicios de visión y odontología\n"
+            "     - Prescription drug coverage → Cobertura de medicamentos recetados\n"
+            "     - Preventive care services → Servicios de atención preventiva\n"
+            "     - Bachelor's degree → Bachillerato en\n"
+            "     - Solid skills → Excelentes habilidades\n"
+            "     - Solid experience → experiencia\n"
+            "   - Company and program names remain in English unless an official localized version exists:\n"
+            "     - Contoso Electronics\n"
+            "     - Northwind Health Plus\n"
+            "     - Northwind Standard\n"
+            "     - PerksPlus\n"
+            "     - Role Library\n\n"
+            "3. **Language Integrity**\n"
+            "   - Output must be entirely in Spanish (no English code-switching, unless the term is in the glossary as \"do not translate\").\n"
+            "   - Do not invent hybrid or non-Spanish words.\n\n"
+            "4. **Grammar & Style**\n"
+            "   - Ensure gender/number agreement (*el olor*, *las sílabas*).\n"
+            "   - Prefer idiomatic Spanish syntax (avoid literal calques like *fue completado*; use *se completó*).\n"
+            "   - Use inclusive forms when possible (e.g., *el personal* instead of *los empleados* when generic).\n\n"
+            "5. **Formatting & Structure**\n"
+            "   - Preserve structure: tables, bullet points, numbering.\n"
+            "   - Convert dates and numbers to Spanish norms: *March 5, 2023 → 5 de marzo de 2023*.\n"
+            "   - Keep units, currencies, and placeholders consistent.\n\n"
+            "6. **Ambiguity & Accuracy**\n"
+            "   - If a term has multiple meanings, choose the HR/benefits/legal sense.\n"
+            "   - If uncertain, provide the safest neutral option without inventing details.\n\n"
+            "### Output Format:\n"
+            "- Spanish translation only.\n"
+            "- Preserve all formatting from the source.\n"
+            "- If a rule cannot be followed, prepend: `@@FLAG:` with a short explanation."
         )
 
     def _build_translation_prompt(self, content: str, chunk_type: str) -> str:
-        """Construct the prompt to send to the provider. Uses an external template
-        when available, and falls back to a concise inline prompt otherwise.
-        """
+        """Construct the prompt to send to the provider."""
         guidance = TYPE_GUIDANCE.get(chunk_type, "Translate this text naturally to Spanish")
-
-        if self._template:
-            try:
-                return self._template.format(guidance=guidance, content=content)
-            except Exception:
-                # If the external template is malformed, fall back to inline.
-                pass
-
-        # Minimal inline fallback to keep functionality if template is missing
         return f"{guidance}\n\nEnglish markdown:\n{content}\n\nSpanish translation:"
 
     # -- Token estimation & cost helpers ---------------------------------
@@ -184,14 +213,34 @@ class MarkdownTranslator:
         return translate_fn(chunk_content, chunk_type)
 
     def _translate_chunk_openai(self, content: str, chunk_type: str) -> Tuple[str, int]:
-        """Translate a chunk using OpenAI."""
+        """Translate a chunk using OpenAI with configurable speed optimizations."""
         user_prompt = self._build_translation_prompt(content, chunk_type)
-        # Pass temperature to make decoding settings consistent across providers
-        response = self.openai_client.chat.completions.create(
-            model=self.openai_model,
-            messages=[{"role": "system", "content": self.system_prompt}, {"role": "user", "content": user_prompt}],
+        
+        # Build API call parameters
+        params = {
+            "model": self.openai_model,
+            "messages": [{"role": "system", "content": self.system_prompt}, {"role": "user", "content": user_prompt}],
+        }
+        
+        # Add GPT-5 specific parameters if using GPT-5
+        if "gpt-5" in self.openai_model.lower():
+            if self.reasoning_effort == "minimal":
+                params["reasoning_effort"] = "minimal"
+            elif self.reasoning_effort == "low":
+                params["reasoning_effort"] = "low" 
+            elif self.reasoning_effort == "medium":
+                params["reasoning_effort"] = "medium"
+            elif self.reasoning_effort == "high":
+                params["reasoning_effort"] = "high"
             
-        )
+            if self.verbosity == "low":
+                params["verbosity"] = "low"
+            elif self.verbosity == "medium":
+                params["verbosity"] = "medium"
+            elif self.verbosity == "high":
+                params["verbosity"] = "high"
+        
+        response = self.openai_client.chat.completions.create(**params)
 
         # Try common response shapes safely
         # Try to return text and usage if available
@@ -337,15 +386,37 @@ class MarkdownTranslator:
 
     # Support removed
     # -- High-level workflow ------------------------------------------------
-    def translate_full_markdown(self, markdown_text: str, provider: str = "openai") -> Tuple[str, int]:
+    def translate_full_markdown(self, markdown_text: str, provider: str = "openai", parallel: bool = True) -> Tuple[str, int]:
         """Translate an entire markdown document while preserving structure.
+
+        Args:
+            markdown_text: The markdown text to translate
+            provider: The translation provider to use
+            parallel: Whether to process chunks in parallel for speed (default: True)
 
         Returns a tuple (translated_text, total_tokens) for the whole document.
         """
-        print(f"Splitting markdown into chunks for {provider} translation...")
-        chunks = self.split_markdown_for_translation(markdown_text)
+        # Determine if this is a large file that needs special handling
+        is_large_file = len(markdown_text) > 10000  # 10KB threshold
+        
+        if is_large_file:
+            print(f"Large file detected ({len(markdown_text)} chars) - using sequential processing with smaller chunks for better text order")
+            # Use smaller chunks for large files to preserve order
+            chunks = self.split_markdown_for_translation(markdown_text, max_chunk_chars=1000)
+            parallel = False  # Force sequential for large files
+        else:
+            print(f"Splitting markdown into chunks for {provider} translation...")
+            chunks = self.split_markdown_for_translation(markdown_text)
+        
         print(f"Created {len(chunks)} chunks")
 
+        if parallel and len(chunks) > 1:
+            return self._translate_chunks_parallel(chunks, provider)
+        else:
+            return self._translate_chunks_sequential(chunks, provider)
+
+    def _translate_chunks_sequential(self, chunks: List[Tuple[str, str]], provider: str) -> Tuple[str, int]:
+        """Translate chunks sequentially (original method)."""
         translated_chunks: List[str] = []
         total_tokens = 0
         for i, (chunk_type, content) in enumerate(chunks):
@@ -355,6 +426,50 @@ class MarkdownTranslator:
             total_tokens += tokens
 
         return "\n\n".join(translated_chunks), total_tokens
+
+    def _translate_chunks_parallel(self, chunks: List[Tuple[str, str]], provider: str) -> Tuple[str, int]:
+        """Translate chunks in parallel for faster processing."""
+        import concurrent.futures
+        import threading
+        
+        print(f"Translating {len(chunks)} chunks in parallel...")
+        
+        # Thread-safe progress tracking
+        progress_lock = threading.Lock()
+        completed = [0]
+        
+        def translate_with_progress(chunk_data):
+            i, (chunk_type, content) = chunk_data
+            try:
+                text, tokens = self.translate_markdown_chunk(content, chunk_type, provider)
+                with progress_lock:
+                    completed[0] += 1
+                    print(f"Completed chunk {completed[0]}/{len(chunks)} (type: {chunk_type})")
+                return i, text, tokens
+            except Exception as e:
+                with progress_lock:
+                    completed[0] += 1
+                    print(f"Error in chunk {completed[0]}/{len(chunks)}: {e}")
+                return i, f"[Translation Error: {e}]", 0
+
+        # Use ThreadPoolExecutor for I/O-bound API calls
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            # Submit all chunks with their original indices
+            futures = {
+                executor.submit(translate_with_progress, (i, chunk)): i 
+                for i, chunk in enumerate(chunks)
+            }
+            
+            # Collect results maintaining order
+            results: List[str] = [""] * len(chunks)
+            total_tokens = 0
+            
+            for future in concurrent.futures.as_completed(futures):
+                i, text, tokens = future.result()
+                results[i] = text
+                total_tokens += tokens
+
+        return "\n\n".join(results), total_tokens
 
     # -- PDF generation -----------------------------------------------------
     def markdown_to_pdf(self, markdown_text: str, output_path: str):
